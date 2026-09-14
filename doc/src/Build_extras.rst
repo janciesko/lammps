@@ -905,11 +905,12 @@ This list was last updated for version 5.2.1 of the Kokkos library.
 
       This will enable FFTs on the GPU using the oneMKL library.
 
-      To simplify compilation, seven preset files are included in the
+      To simplify compilation, eight preset files are included in the
       ``cmake/presets`` folder, ``kokkos-serial.cmake``,
       ``kokkos-openmp.cmake``, ``kokkos-cuda.cmake``,
       ``kokkos-cuda-nowrapper.cmake``, ``kokkos-hip.cmake``,
-      ``kokkos-sycl-nvidia.cmake``, and ``kokkos-sycl-intel.cmake``.
+      ``kokkos-sycl-nvidia.cmake``, ``kokkos-sycl-intel.cmake``, and
+      ``kokkos-stdexec.cmake``.
       They will enable the KOKKOS package and enable some hardware
       choices.  For GPU support those preset files may need to be
       customized to match the hardware used.  For some platforms,
@@ -928,6 +929,8 @@ This list was last updated for version 5.2.1 of the Kokkos library.
       The ``kokkos-openmp.cmake`` preset can be combined with any of the
       others, but it is not possible to combine multiple GPU
       acceleration settings (CUDA, HIP, SYCL) into a single executable.
+      The ``kokkos-stdexec.cmake`` preset uses an external Kokkos and
+      kokkos-stdexec install rather than the bundled Kokkos library.
 
       The ``kokkos-packages.cmake`` preset enables all packages that
       contain styles with KOKKOS support.  It does not enable the KOKKOS
@@ -973,6 +976,16 @@ with CMake: ``-DKokkos_ENABLE_HWLOC=on`` or
 The CMake option ``-DKokkos_ENABLE_LIBRT=on`` enables the use of a more
 accurate timer mechanism on many Unix-like platforms for internal
 profiling.
+
+The CMake option ``-D EXTERNAL_KOKKOS=on`` builds against an already
+installed Kokkos library.  Set ``Kokkos_ROOT`` to that install prefix.
+
+The CMake option ``-D EXTERNAL_KOKKOS_STDEXEC=on`` additionally links the
+kokkos-stdexec interoperability library and defines ``LMP_KOKKOS_STDEXEC``.
+This implies ``EXTERNAL_KOKKOS``.  Set ``KokkosStdexec_ROOT`` to the
+kokkos-stdexec install prefix or source tree, and ``stdexec_ROOT`` to the
+stdexec install prefix.  A matching preset is
+``cmake/presets/kokkos-stdexec.cmake``.
 
 The CMake option ``-DKokkos_ENABLE_DEBUG=on`` enables printing of
 run-time debugging information that can be useful. It also enables
