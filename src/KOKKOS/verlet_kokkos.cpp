@@ -31,6 +31,11 @@
 #include "timer.h"
 #include "kokkos.h"
 
+#ifdef LMP_KOKKOS_STDEXEC
+#include "Kokkos_exec.hpp"
+#include <stdexec/execution.hpp>
+#endif
+
 using namespace LAMMPS_NS;
 
 namespace {
@@ -98,6 +103,25 @@ static void zero_host(const DualView &k, int first, int count, int needed)
   zero_host_view(k.view_host(),first,count);
 }
 
+#ifdef LMP_KOKKOS_STDEXEC
+// Smallest Kokkos-stdexec use in LAMMPS: one parallel_for as a sender.
+template<class View>
+static void parallel_zero(int n, const View &v)
+{
+  namespace ex = stdexec;
+  namespace kex = Kokkos::Experimental::exec;
+  kex::scheduler<LMPDeviceType> gpu{};
+  auto policy = Kokkos::RangePolicy<LMPDeviceType>(0, n);
+  kex::sync_wait(ex::schedule(gpu) | kex::parallel_for(policy, Zero<View>(v)));
+}
+#else
+template<class View>
+static void parallel_zero(int n, const View &v)
+{
+  Kokkos::parallel_for(n, Zero<View>(v));
+}
+#endif
+
 /* ---------------------------------------------------------------------- */
 
 VerletKokkos::VerletKokkos(LAMMPS *lmp, int narg, char **arg) :
@@ -114,6 +138,9 @@ void VerletKokkos::setup(int flag)
 {
   if (comm->me == 0 && screen) {
     fputs("Setting up Verlet run ...\n",screen);
+#ifdef LMP_KOKKOS_STDEXEC
+    fputs("  Kokkos stdexec: force_clear uses a sender pipeline\n",screen);
+#endif
     if (flag) {
       utils::print(screen,"  Unit style    : {}\n"
                         "  Current step  : {}\n"
@@ -642,12 +669,12 @@ void VerletKokkos::force_clear()
     int nall = atomKK->nlocal;
     if (force->newton) nall += atomKK->nghost;
 
-    Kokkos::parallel_for(nall, Zero<DAT::t_kkacc_1d_3>(atomKK->k_f.view_device()));
+    parallel_zero(nall, atomKK->k_f.view_device());
     zero_host(atomKK->k_f,0,nall,clear_host);
     atomKK->modified(Device,F_MASK);
 
     if (torqueflag) {
-      Kokkos::parallel_for(nall, Zero<DAT::t_kkacc_1d_3>(atomKK->k_torque.view_device()));
+      parallel_zero(nall, atomKK->k_torque.view_device());
       zero_host(atomKK->k_torque,0,nall,clear_host);
       atomKK->modified(Device,TORQUE_MASK);
     }
@@ -655,10 +682,10 @@ void VerletKokkos::force_clear()
     // reset SPIN forces
 
     if (extraflag) {
-      Kokkos::parallel_for(nall, Zero<DAT::t_kkacc_1d_3>(atomKK->k_fm.view_device()));
+      parallel_zero(nall, atomKK->k_fm.view_device());
       zero_host(atomKK->k_fm,0,nall,clear_host);
       atomKK->modified(Device,FM_MASK);
-      Kokkos::parallel_for(nall, Zero<DAT::t_kkacc_1d_3>(atomKK->k_fm_long.view_device()));
+      parallel_zero(nall, atomKK->k_fm_long.view_device());
       zero_host(atomKK->k_fm_long,0,nall,clear_host);
       atomKK->modified(Device,FML_MASK);
     }
@@ -668,12 +695,12 @@ void VerletKokkos::force_clear()
   // if either newton flag is set, also include ghosts
 
   } else {
-    Kokkos::parallel_for(atomKK->nfirst, Zero<DAT::t_kkacc_1d_3>(atomKK->k_f.view_device()));
+    parallel_zero(atomKK->nfirst, atomKK->k_f.view_device());
     zero_host(atomKK->k_f,0,atomKK->nfirst,clear_host);
     atomKK->modified(Device,F_MASK);
 
     if (torqueflag) {
-      Kokkos::parallel_for(atomKK->nfirst, Zero<DAT::t_kkacc_1d_3>(atomKK->k_torque.view_device()));
+      parallel_zero(atomKK->nfirst, atomKK->k_torque.view_device());
       zero_host(atomKK->k_torque,0,atomKK->nfirst,clear_host);
       atomKK->modified(Device,TORQUE_MASK);
     }
@@ -681,10 +708,10 @@ void VerletKokkos::force_clear()
     // reset SPIN forces
 
     if (extraflag) {
-      Kokkos::parallel_for(atomKK->nfirst, Zero<DAT::t_kkacc_1d_3>(atomKK->k_fm.view_device()));
+      parallel_zero(atomKK->nfirst, atomKK->k_fm.view_device());
       zero_host(atomKK->k_fm,0,atomKK->nfirst,clear_host);
       atomKK->modified(Device,FM_MASK);
-      Kokkos::parallel_for(atomKK->nfirst, Zero<DAT::t_kkacc_1d_3>(atomKK->k_fm_long.view_device()));
+      parallel_zero(atomKK->nfirst, atomKK->k_fm_long.view_device());
       zero_host(atomKK->k_fm_long,0,atomKK->nfirst,clear_host);
       atomKK->modified(Device,FML_MASK);
     }
@@ -787,6 +814,10 @@ void VerletKokkos::fuse_check(int i, int n)
   else if (torqueflag || extraflag || neighbor->includegroup) fuse_force_clear = 0;
   else if (!force->pair || !pair_compute_flag) fuse_force_clear = 0;
   else if (!force->pair->fuse_force_clear_flag) fuse_force_clear = 0;
+#ifdef LMP_KOKKOS_STDEXEC
+  // keep the standalone force_clear() sender path instead of fusing into pair
+  fuse_force_clear = 0;
+#endif
 
   fuse_integrate = 1;
   if (modify->n_end_of_step) fuse_integrate = 0;
