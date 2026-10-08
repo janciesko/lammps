@@ -31,6 +31,8 @@
 #include "timer.h"
 #include "kokkos.h"
 
+#include <cstdlib>
+
 #ifdef LMP_KOKKOS_STDEXEC
 #include "Kokkos_exec.hpp"
 #include <stdexec/execution.hpp>
@@ -1009,6 +1011,14 @@ void VerletKokkos::fuse_check(int i, int n)
   // Keep the zero as its own launch so pair compute follows it on the device.
   fuse_force_clear = 0;
 #endif
+  // Benchmarking switch: LMP_KOKKOS_NO_FUSE_FORCE_CLEAR=1 keeps the force zero
+  // a separate kernel in the original build too, so both variants launch the
+  // same kernels and only the ordering/overlap differs.
+  static const bool no_fuse = []() {
+    const char *e = std::getenv("LMP_KOKKOS_NO_FUSE_FORCE_CLEAR");
+    return e && *e && *e != '0';
+  }();
+  if (no_fuse) fuse_force_clear = 0;
 
   fuse_integrate = 1;
   if (modify->n_end_of_step) fuse_integrate = 0;
