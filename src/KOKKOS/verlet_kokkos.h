@@ -49,6 +49,8 @@ class VerletKokkos : public Verlet {
   DAT::t_kkacc_1d_3 f_merge_copy,f;
   int fuse_force_clear,fuse_integrate;
 
+  // wait = 0 launches only. Pair compute is the next kernel on this device.
+  void clear_force_arrays(int wait);
   void fuse_check(int, int);
   int overlap_possible();
   int host_force_styles(uint64_t * = nullptr);
