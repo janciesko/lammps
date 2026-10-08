@@ -1,0 +1,34 @@
+kokkos-stdexec: 3d LJ melt. On CUDA the force zero runs on its own stream
+and overlaps the halo exchange. The pair kernel waits for that zero on
+the device, not through a host fence. The remaining host fence is the one
+before reverse communication.
+
+Build LAMMPS with the KOKKOS package and an external kokkos-stdexec:
+
+  cmake -S cmake -B build-stdexec \
+    -C cmake/presets/kokkos-stdexec.cmake \
+    -D CMAKE_BUILD_TYPE=Release \
+    -D CMAKE_CXX_COMPILER=clang++ -D CMAKE_CXX_STANDARD=20 \
+    -D EXTERNAL_KOKKOS_STDEXEC=ON \
+    -D Kokkos_ROOT=/path/to/kokkos/install \
+    -D KokkosStdexec_ROOT=/path/to/kokkos-stdexec/install \
+    -D stdexec_ROOT=/path/to/stdexec/install
+
+The preset already sets PKG_KOKKOS=ON and EXTERNAL_KOKKOS_STDEXEC=ON (which
+implies EXTERNAL_KOKKOS). The original variant for comparison is the same
+configure without the preset and without EXTERNAL_KOKKOS_STDEXEC,
+KokkosStdexec_ROOT and stdexec_ROOT; add -D PKG_KOKKOS=ON -D EXTERNAL_KOKKOS=ON.
+
+The setup banner should include:
+  Kokkos stdexec: force zero overlaps comm; pair waits on device
+
+Run:
+
+  lmp -k on g 1 -sf kk -in in.lj
+  mpirun -np 4 lmp -k on g 4 -sf kk -in in.lj
+
+Benchmark original vs kokkos-stdexec (builds both, runs 4 ranks x 1 GPU):
+
+  bench/bench_stdexec.sh all
+
+See the header of bench/bench_stdexec.sh for options.

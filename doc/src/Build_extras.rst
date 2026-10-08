@@ -986,6 +986,10 @@ This implies ``EXTERNAL_KOKKOS``.  Set ``KokkosStdexec_ROOT`` to the
 kokkos-stdexec install prefix or source tree, and ``stdexec_ROOT`` to the
 stdexec install prefix.  A matching preset is
 ``cmake/presets/kokkos-stdexec.cmake``.
+When enabled on CUDA, ``VerletKokkos::run()`` zeros forces on side
+streams so the zero overlaps the halo exchange. The pair kernel waits
+for that zero with a device-side event. ``force_clear()`` still waits
+before returning. See ``examples/kokkos-stdexec``.
 
 The CMake option ``-DKokkos_ENABLE_DEBUG=on`` enables printing of
 run-time debugging information that can be useful. It also enables
