@@ -165,26 +165,33 @@ void start_sender(Sender &&snd)
   if (error) std::rethrow_exception(error);
 }
 
-// Scheduler used to zero the per-atom force arrays (f, and torque and the
-// SPIN forces when present).
+// Scheduler used to zero one per-atom force array.
 //
-// On CUDA this is a side stream, so the zeros overlap the default-stream
-// forward communication (the ghost position pack/MPI/unpack, or the
-// on-device ghost copy on one rank). All arrays are zeroed on this one
-// stream, so they run in order and a single order_streams(DefaultAfterZero) covers all of
-// them. The pair kernel stays on the default stream and waits for this stream
-// on the device.
-// Without CUDA this is a scheduler on the default instance.
-// The scheduler (and its stream) is a function-local static, created on
+// Slot 0 is the force array. On CUDA each slot is its own stream so the
+// zeros overlap each other and the default-stream forward communication
+// (the ghost position pack/MPI/unpack, or the on-device ghost copy on one
+// rank). The pair kernel stays on the default stream and waits for the zero
+// streams on the device, see order_streams(). The slots are:
+//   0 = f, 1 = torque, 2 = fm, 3 = fm_long
+// Without CUDA there is a single scheduler on the default instance.
+// The schedulers (and their streams) are function-local statics, created on
 // first use and kept for the lifetime of the process.
-Kokkos::Experimental::exec::scheduler<LMPDeviceType> &zero_scheduler()
+Kokkos::Experimental::exec::scheduler<LMPDeviceType> &zero_scheduler(int slot)
 {
 #ifdef KOKKOS_ENABLE_CUDA
-  static auto parts = Kokkos::Experimental::partition_space(LMPDeviceType{}, 1);
-  static Kokkos::Experimental::exec::scheduler<LMPDeviceType> sched{parts[0]};
-  return sched;
+  static auto parts =
+      Kokkos::Experimental::partition_space(LMPDeviceType{}, 1, 1, 1, 1);
+  static Kokkos::Experimental::exec::scheduler<LMPDeviceType> s0{parts[0]};
+  static Kokkos::Experimental::exec::scheduler<LMPDeviceType> s1{parts[1]};
+  static Kokkos::Experimental::exec::scheduler<LMPDeviceType> s2{parts[2]};
+  static Kokkos::Experimental::exec::scheduler<LMPDeviceType> s3{parts[3]};
+  if (slot == 1) return s1;
+  if (slot == 2) return s2;
+  if (slot == 3) return s3;
+  return s0;
 #else
   static Kokkos::Experimental::exec::scheduler<LMPDeviceType> gpu{};
+  (void) slot;
   return gpu;
 #endif
 }
@@ -192,38 +199,58 @@ Kokkos::Experimental::exec::scheduler<LMPDeviceType> &zero_scheduler()
 #ifdef KOKKOS_ENABLE_CUDA
 // Which stream waits for which, see order_streams().
 enum class ZeroOrder {
-  ZeroAfterDefault,    // zero stream waits for the default stream
-  DefaultAfterZero     // default stream waits for the zero stream
+  ZeroAfterDefault,    // zero streams wait for the default stream
+  DefaultAfterZero     // default stream waits for the zero streams
 };
 
-// Order the zero stream and the default stream on the device, without
+// Order the zero streams and the default stream on the device, without
 // blocking the host.
 //
 // An event is recorded on the stream that goes first and the other stream is
 // told to wait for it (cudaStreamWaitEvent). Both calls return immediately,
 // the ordering is enforced on the device. The wait captures the event as
-// recorded at that point, so one event serves both directions.
+// recorded at that point, so one event serves every stream and both
+// directions.
 //
 // ZeroAfterDefault: the integrate kernels on the default stream read the
-// forces and the zeros on the side stream write them, so the zeros must not
+// forces and the zeros on the side streams write them, so the zeros must not
 // start before those kernels finish. Call this before launching zeros.
 //
 // DefaultAfterZero: the pair kernel, which runs on the default stream, starts
-// only after all zeroed arrays (f, torque, SPIN forces) are done, as they
-// share the zero stream.
-void order_streams(ZeroOrder order)
+// only after the zeroed arrays are done.
+//
+// nslots is the number of zero streams involved, slots 0..nslots-1, see
+// zero_slots().
+void order_streams(ZeroOrder order, int nslots)
 {
   auto *main = LMPDeviceType{}.impl_internal_space_instance();
-  auto *side = zero_scheduler().execution_space().impl_internal_space_instance();
-  auto *first = (order == ZeroOrder::ZeroAfterDefault) ? main : side;
-  auto *second = (order == ZeroOrder::ZeroAfterDefault) ? side : main;
 
   static cudaEvent_t event = nullptr;
   if (!event)
     main->cuda_event_create_with_flags_wrapper(&event, cudaEventDisableTiming);
-  first->cuda_event_record_wrapper(event);
-  second->set_cuda_device();
-  cudaStreamWaitEvent(second->m_stream, event, 0);
+
+  if (order == ZeroOrder::ZeroAfterDefault) {
+    main->cuda_event_record_wrapper(event);
+    for (int slot = 0; slot < nslots; ++slot) {
+      auto *side = zero_scheduler(slot).execution_space().impl_internal_space_instance();
+      side->set_cuda_device();
+      cudaStreamWaitEvent(side->m_stream, event, 0);
+    }
+  } else {
+    main->set_cuda_device();
+    for (int slot = 0; slot < nslots; ++slot) {
+      auto *side = zero_scheduler(slot).execution_space().impl_internal_space_instance();
+      side->cuda_event_record_wrapper(event);
+      cudaStreamWaitEvent(main->m_stream, event, 0);
+    }
+  }
+}
+
+// Number of zero streams in use: slot 0 (f) always, slot 1 (torque) with
+// torqueflag, slots 2 and 3 (fm, fm_long) with extraflag.
+inline int zero_slots(int torqueflag, int extraflag)
+{
+  return extraflag ? 4 : (torqueflag ? 2 : 1);
 }
 #endif
 
@@ -233,22 +260,23 @@ void order_streams(ZeroOrder order)
 /* ----------------------------------------------------------------------
    zero rows begin..end-1 of a per-atom 3-vector device view
 
-   with stdexec the zero is launched as a sender on the zero scheduler (see
-   zero_scheduler()) and the call returns after the launch. Without stdexec
-   this is a plain Kokkos::parallel_for on the default instance. Neither
-   variant waits for the kernel to finish.
+   with stdexec the zero is launched as a sender on the scheduler of the given
+   slot (see zero_scheduler()) and the call returns after the launch. Without
+   stdexec this is a plain Kokkos::parallel_for on the default instance and
+   slot is ignored. Neither variant waits for the kernel to finish.
 ------------------------------------------------------------------------- */
 
 template<class View>
-static void parallel_zero(int begin, int end, const View &v)
+static void parallel_zero(int begin, int end, const View &v, int slot = 0)
 {
   auto policy = Kokkos::RangePolicy<LMPDeviceType>(begin, end);
 #ifdef LMP_KOKKOS_STDEXEC
   namespace ex = stdexec;
   namespace kex = Kokkos::Experimental::exec;
-  start_sender(ex::schedule(zero_scheduler()) |
+  start_sender(ex::schedule(zero_scheduler(slot)) |
                kex::parallel_for(policy, Zero<View>(v)));
 #else
+  (void) slot;
   Kokkos::parallel_for(policy, Zero<View>(v));
 #endif
 }
@@ -580,8 +608,9 @@ void VerletKokkos::run(int n)
 #ifdef LMP_KOKKOS_STDEXEC
 #ifdef KOKKOS_ENABLE_CUDA
     if (nflag != 0) clear_force_arrays(0);
-    // Pair stream waits for the force zero. The host does not.
-    if (!external_force_clear) order_streams(ZeroOrder::DefaultAfterZero);
+    // Pair stream waits for the force zeros. The host does not.
+    if (!external_force_clear)
+      order_streams(ZeroOrder::DefaultAfterZero, zero_slots(torqueflag, extraflag));
 #else
     clear_force_arrays(0);
 #endif
@@ -808,11 +837,11 @@ void VerletKokkos::force_clear()
    wait = 1 also fences all execution spaces, including the zero stream,
    before returning (stdexec only, otherwise the zero is already ordered)
 
-   with stdexec on CUDA the zeros of all arrays run on one side stream, see
-   zero_scheduler(). It is first ordered after the integrate kernels on the
-   default stream by order_streams(ZeroAfterDefault). With wait = 0 the caller
-   joins the zero stream back into the default stream with
-   order_streams(DefaultAfterZero).
+   with stdexec on CUDA each array is zeroed on its own side stream, see
+   zero_scheduler(). The streams are first ordered after the integrate
+   kernels on the default stream by order_streams(ZeroAfterDefault). With
+   wait = 0 the caller joins the zero streams back into the default stream
+   with order_streams(DefaultAfterZero).
    returns without doing anything if the forces are cleared externally
 ------------------------------------------------------------------------- */
 
@@ -824,7 +853,7 @@ void VerletKokkos::clear_force_arrays(int wait)
 #ifdef KOKKOS_ENABLE_CUDA
   // Prior kernels on the default stream (integrate) must finish reading
   // forces before these side-stream zeros write them. Device wait, no fence.
-  order_streams(ZeroOrder::ZeroAfterDefault);
+  order_streams(ZeroOrder::ZeroAfterDefault, zero_slots(torqueflag, extraflag));
 #endif
 #endif
 
@@ -859,7 +888,7 @@ void VerletKokkos::clear_force_arrays(int wait)
     atomKK->modified(Device,F_MASK);
 
     if (torqueflag) {
-      parallel_zero(0, nall, atomKK->k_torque.view_device());
+      parallel_zero(0, nall, atomKK->k_torque.view_device(), 1);
       zero_host(atomKK->k_torque,0,nall,clear_host);
       atomKK->modified(Device,TORQUE_MASK);
     }
@@ -867,10 +896,10 @@ void VerletKokkos::clear_force_arrays(int wait)
     // reset SPIN forces
 
     if (extraflag) {
-      parallel_zero(0, nall, atomKK->k_fm.view_device());
+      parallel_zero(0, nall, atomKK->k_fm.view_device(), 2);
       zero_host(atomKK->k_fm,0,nall,clear_host);
       atomKK->modified(Device,FM_MASK);
-      parallel_zero(0, nall, atomKK->k_fm_long.view_device());
+      parallel_zero(0, nall, atomKK->k_fm_long.view_device(), 3);
       zero_host(atomKK->k_fm_long,0,nall,clear_host);
       atomKK->modified(Device,FML_MASK);
     }
@@ -887,7 +916,7 @@ void VerletKokkos::clear_force_arrays(int wait)
     atomKK->modified(Device,F_MASK);
 
     if (torqueflag) {
-      parallel_zero(0, nfirst, atomKK->k_torque.view_device());
+      parallel_zero(0, nfirst, atomKK->k_torque.view_device(), 1);
       zero_host(atomKK->k_torque,0,nfirst,clear_host);
       atomKK->modified(Device,TORQUE_MASK);
     }
@@ -895,10 +924,10 @@ void VerletKokkos::clear_force_arrays(int wait)
     // reset SPIN forces
 
     if (extraflag) {
-      parallel_zero(0, nfirst, atomKK->k_fm.view_device());
+      parallel_zero(0, nfirst, atomKK->k_fm.view_device(), 2);
       zero_host(atomKK->k_fm,0,nfirst,clear_host);
       atomKK->modified(Device,FM_MASK);
-      parallel_zero(0, nfirst, atomKK->k_fm_long.view_device());
+      parallel_zero(0, nfirst, atomKK->k_fm_long.view_device(), 3);
       zero_host(atomKK->k_fm_long,0,nfirst,clear_host);
       atomKK->modified(Device,FML_MASK);
     }
@@ -912,16 +941,16 @@ void VerletKokkos::clear_force_arrays(int wait)
       atomKK->modified(Device,F_MASK);
 
       if (torqueflag) {
-        parallel_zero(begin, end, atomKK->k_torque.view_device());
+        parallel_zero(begin, end, atomKK->k_torque.view_device(), 1);
         zero_host(atomKK->k_torque,begin,atomKK->nghost,clear_host);
         atomKK->modified(Device,TORQUE_MASK);
       }
 
       if (extraflag) {
-        parallel_zero(begin, end, atomKK->k_fm.view_device());
+        parallel_zero(begin, end, atomKK->k_fm.view_device(), 2);
         zero_host(atomKK->k_fm,begin,atomKK->nghost,clear_host);
         atomKK->modified(Device,FM_MASK);
-        parallel_zero(begin, end, atomKK->k_fm_long.view_device());
+        parallel_zero(begin, end, atomKK->k_fm_long.view_device(), 3);
         zero_host(atomKK->k_fm_long,begin,atomKK->nghost,clear_host);
         atomKK->modified(Device,FML_MASK);
       }
